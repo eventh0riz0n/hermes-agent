@@ -98,6 +98,12 @@ class MyMemoryProvider(MemoryProvider):
     # ... implement remaining methods
 ```
 
+Initialization includes `platform` (default `cli`) and `agent_context`: `cron`,
+`subagent`, or `flush` for those explicit platforms, and `primary` otherwise.
+The session ID is opaque and is forwarded unchanged; do not infer context from it.
+Providers decide how to use this context. Warning and status callbacks are supplied
+only on the CLI. `skip_memory=True` still skips external provider initialization.
+
 ## Required Methods
 
 ### Core Lifecycle

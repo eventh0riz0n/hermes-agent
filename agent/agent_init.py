@@ -1206,7 +1206,7 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        "agent_context": "primary",
+        "agent_context": platform if platform in {"cron", "subagent", "flush"} else "primary",
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning

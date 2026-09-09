@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 class RecordingMemoryProvider:
     name = "recording"
@@ -126,6 +128,64 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+@pytest.mark.parametrize("platform", [None, "cli", "telegram", "cron", "subagent", "flush"])
+def test_memory_context_through_constructor(tmp_path, monkeypatch, platform):
+    from cron.scheduler import _construct_cron_agent, _CronAgentSetup
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider_dir = tmp_path / "plugins" / "recording_context"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        "from agent.memory_provider import MemoryProvider\n"
+        "class Recording(MemoryProvider):\n"
+        "    name = 'recording_context'\n"
+        "    def is_available(self): return True\n"
+        "    def get_tool_schemas(self): return []\n"
+        "    def initialize(self, session_id, **kwargs):\n"
+        "        self.received = dict(session_id=session_id, **kwargs)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n  provider: recording_context\n", encoding="utf-8"
+    )
+    runtime = dict(api_key="fixture-key", base_url="https://researcher.invalid/v1")
+    session_id = "opaque-fixture-session"
+    with (
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        if platform == "cron":
+            agent = _construct_cron_agent(
+                AIAgent, {}, {},
+                _CronAgentSetup(model="fixture-model", runtime=runtime, max_iterations=1),
+                workdir=None, session_id=session_id, session_db=None,
+            )
+        else:
+            agent = AIAgent(
+                **runtime, model="fixture-model", platform=platform, session_id=session_id,
+                quiet_mode=True, skip_context_files=True, skip_memory=False,
+            )
+    try:
+        assert agent._memory_manager is not None
+        received = agent._memory_manager.providers[0].received
+        assert received["session_id"] == session_id
+        assert received["hermes_home"] == str(tmp_path)
+        assert received["platform"] == (platform or "cli")
+        expected = platform if platform in {"cron", "subagent", "flush"} else "primary"
+        assert received["agent_context"] == expected
+        if platform in {None, "cli"}:
+            assert received["warning_callback"] == agent._emit_warning
+            assert received["status_callback"] == agent._emit_status
+        else:
+            assert "warning_callback" not in received
+            assert "status_callback" not in received
+    finally:
+        agent.close()
 
 
 class CoreShadowProvider:
