@@ -114,6 +114,8 @@ def test_micro_compaction_splice_rearms_read_dedup(served, splice, monkeypatch):
     # A splice took the skill body and may have taken the file body: both repeats serve content again.
     # A no-op pass removed nothing, so both stubs stay.
     assert _dedup_state() == ((False, False) if splice else (True, True))
+    # The loop guardrail follows the same boundary: a splice starts a new context generation.
+    assert agent._tool_guardrails._context_generation == (1 if splice else 0)
 
 
 def test_native_checkpoint_rearms_read_dedup(served, monkeypatch):
@@ -142,3 +144,39 @@ def test_native_checkpoint_rearms_read_dedup(served, monkeypatch):
     re_view = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "call_view"]
     assert re_view and "Do the demo steps." in re_view[-1]["content"]
     assert _dedup_state()[1] is False  # the file read served before the checkpoint is off the wire too
+
+
+@pytest.mark.parametrize("mode", ["reset", "hold"])
+def test_repeated_native_checkpoints_do_not_halt_one_reread_each(served, mode, monkeypatch):
+    """2026-10-11 incident: every native checkpoint is followed by one re-view of the same skill. Each
+    re-view delivers the full body (the dedup re-arms), so the results are byte-identical; with hard
+    stops on, the 6th used to be refused as idempotent_no_progress and the turn ended mid-work."""
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+    from run_agent import AIAgent
+    monkeypatch.setattr("agent.model_metadata._fetch_codex_oauth_context_lengths_with_source", lambda _t, **_kw: ({}, False))
+    agent = AIAgent(model="gpt-5.6", base_url="https://chatgpt.com/backend-api/codex", api_key="codex-token",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True, max_iterations=12)
+    agent.codex_responses_native_compaction = True
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent._tool_guardrails = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, after_context_loss=mode))
+    usage = SimpleNamespace(input_tokens=9, output_tokens=1, total_tokens=10)
+    rounds = 7
+    responses = [
+        SimpleNamespace(output=[
+            SimpleNamespace(type="compaction", encrypted_content=f"opaque-checkpoint-{i}"),
+            SimpleNamespace(type="function_call", id=f"fc_view_{i}", call_id=f"call_view_{i}", name="skill_view",
+                            arguments=json.dumps({"name": "demo-skill"}))],
+            usage=usage, status="completed", model="gpt-5.6")
+        for i in range(rounds)
+    ] + [SimpleNamespace(output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="done")])],
+                         usage=usage, status="completed", model="gpt-5.6")]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    result = _run(agent, served, monkeypatch)
+
+    re_views = [m["content"] for m in result["messages"]
+                if m.get("role") == "tool" and str(m.get("tool_call_id", "")).startswith("call_view_")]
+    assert len(re_views) == rounds
+    assert all("Do the demo steps." in body and "Blocked" not in body for body in re_views)
+    assert agent._tool_guardrails.halt_decision is None

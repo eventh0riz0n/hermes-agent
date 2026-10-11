@@ -478,3 +478,134 @@ def test_execute_code_replay_streak_notice_fires_on_warn_only_desktop_config():
     assert notices[:2] == [None, None]
     assert all(n is not None and "consecutive identical call to execute_code" in n for n in notices[2:]), notices
     assert controller.halt_decision is None, "warn-only surfaces must not halt"
+
+
+# --- context-loss boundaries (#109683) -------------------------------------------------------------
+
+import pytest
+
+SKILL = {"name": "persistent-agent-runtime-operations"}
+SKILL_BODY = "skill body " * 100
+
+
+def _hard_stop_controller(mode="reset"):
+    return ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True, after_context_loss=mode))
+
+
+def _read(ctrl, args=SKILL, result=SKILL_BODY, call_id=""):
+    before = ctrl.before_call("skill_view", args)
+    if not before.allows_execution:
+        return before, None
+    return ctrl.after_call("skill_view", args, result, failed=False), ctrl.observe_call(
+        "skill_view", args, result, tool_call_id=call_id)
+
+
+def test_after_context_loss_config_parses_modes_and_defaults_to_reset():
+    assert ToolCallGuardrailConfig.from_mapping({}).after_context_loss == "reset"
+    for mode in ("reset", "hold", "off"):
+        assert ToolCallGuardrailConfig.from_mapping({"after_context_loss": f" {mode.upper()} "}).after_context_loss == mode
+    assert ToolCallGuardrailConfig.from_mapping({"after_context_loss": "bogus"}).after_context_loss == "reset"
+
+
+@pytest.mark.parametrize("mode", ["reset", "hold"])
+def test_one_reread_per_context_boundary_is_never_counted(mode):
+    """The 2026-10-11 incident shape: a long turn compacts repeatedly and re-reads one skill after each."""
+    ctrl = _hard_stop_controller(mode)
+    _read(ctrl)
+    for i in range(8):
+        ctrl.after_call("terminal", {"command": f"step {i}"}, "ok", failed=False)
+        ctrl.note_context_boundary()
+        decision, observation = _read(ctrl)
+        assert decision.action == "allow" and decision.count == 1
+        assert observation.notice is None and observation.stub is None
+    assert ctrl.halt_decision is None
+
+
+def test_off_mode_keeps_pre_boundary_behaviour():
+    ctrl = _hard_stop_controller("off")
+    for _ in range(5):
+        ctrl.note_context_boundary()
+        _read(ctrl)
+    assert ctrl.before_call("skill_view", SKILL).code == "idempotent_no_progress_block"
+
+
+def test_reset_mode_gives_each_context_its_own_count():
+    ctrl = _hard_stop_controller("reset")
+    for _ in range(4):
+        _read(ctrl)
+    ctrl.note_context_boundary()
+    decision, _obs = _read(ctrl)
+    assert decision.count == 1
+    for _ in range(4):
+        _read(ctrl)
+    assert ctrl.before_call("skill_view", SKILL).code == "idempotent_no_progress_block"
+
+
+def test_hold_mode_still_blocks_a_loop_across_context_boundaries():
+    """Only the first repeat after a boundary is free: two reads per context still reach the block."""
+    ctrl = _hard_stop_controller("hold")
+    blocked = None
+    for _ in range(6):
+        for _ in range(2):
+            decision, _obs = _read(ctrl)
+            if not decision.allows_execution:
+                blocked = decision
+                break
+        if blocked:
+            break
+        ctrl.note_context_boundary()
+    assert blocked is not None and blocked.code == "idempotent_no_progress_block"
+
+
+def test_hold_mode_consecutive_identical_streak_still_halts_across_boundaries():
+    ctrl = _hard_stop_controller("hold")
+    args, result = {"command": "cat big.log"}, "x" * 600
+    for i in range(12):
+        ctrl.observe_call("terminal", args, result, tool_call_id=f"c{i}")
+        if i % 2 == 1:
+            ctrl.note_context_boundary()
+        if ctrl.halt_decision is not None:
+            break
+    assert ctrl.halt_decision is not None
+    assert ctrl.halt_decision.code == "identical_call_streak_halt"
+
+
+@pytest.mark.parametrize("mode", ["reset", "hold"])
+def test_identical_result_stub_never_points_past_a_boundary(mode):
+    ctrl = _hard_stop_controller(mode)
+    _read(ctrl, call_id="a")
+    _decision, obs = _read(ctrl, call_id="b")
+    assert obs.stub and "tool_call_id a" in obs.stub
+    ctrl.note_context_boundary()
+    _decision, obs = _read(ctrl, call_id="c")
+    assert obs.stub is None and obs.notice is None
+    _decision, obs = _read(ctrl, call_id="d")
+    assert obs.stub and "tool_call_id c" in obs.stub
+
+
+@pytest.mark.parametrize("mode", ["reset", "hold", "off"])
+def test_context_boundary_keeps_failure_counters(mode):
+    ctrl = _hard_stop_controller(mode)
+    bad = {"path": "/missing"}
+    for _ in range(5):
+        ctrl.after_call("read_file", bad, '{"error": "File not found"}', failed=True)
+        ctrl.note_context_boundary()
+    assert ctrl.before_call("read_file", bad).code == "repeated_exact_failure_block"
+
+
+def test_mark_context_loss_boundary_advances_guardrails_even_without_read_cache_reset():
+    from unittest.mock import patch
+    from types import SimpleNamespace
+
+    from agent.conversation_compression_boundary import mark_context_loss_boundary
+
+    ctrl = _hard_stop_controller()
+    agent = SimpleNamespace(session_id="s1", _tool_guardrails=ctrl)
+    with patch("agent.conversation_compression_boundary._reset_read_dedup_caches") as reset:
+        mark_context_loss_boundary(agent, None, reset_read_caches=False)
+        reset.assert_not_called()
+        mark_context_loss_boundary(agent, "task-1")
+        reset.assert_called_once_with("task-1", session_id="s1")
+    assert ctrl._context_generation == 2
+    with patch("agent.conversation_compression_boundary._reset_read_dedup_caches"):
+        mark_context_loss_boundary(SimpleNamespace(session_id=None), "t")  # agent without guardrails

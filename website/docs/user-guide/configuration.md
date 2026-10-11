@@ -2087,12 +2087,21 @@ tool_loop_guardrails:
     exact_failure: 5
     same_tool_failure: 8
     idempotent_no_progress: 5
+  after_context_loss: reset    # reset | hold | off — see "After compaction" below
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
 ```
 
 `hard_stop_enabled` explicitly enables hard stops on every platform. When it remains `false`, `non_interactive_hard_stop_enabled` still enables them for unattended gateway/cron-style platforms while preserving warning-only behavior for CLI, TUI, Desktop, ACP, subagents, and `api_server` runs (supervised task loops with a live parent or client). Set `non_interactive_hard_stop_enabled: false` to opt an unattended deployment out. See also [Docker / unattended deployments](docker.md).
+
+**After compaction.** Compaction, a tool-result prune or a native compaction checkpoint removes earlier tool results from the model's context, so re-reading a file or skill it still needs is recovery, not a loop. `after_context_loss` decides what happens to the count of repeated *successful* results at that point:
+
+- `reset` (default) — the new context starts its own count.
+- `hold` — the count is kept, but the first identical re-read after each boundary is not counted. A loop that re-reads more than once per context still accumulates across compactions.
+- `off` — boundaries are ignored, so re-reads after compaction count like any other repeat.
+
+Repeated failures and the per-turn `loop_caps` are never reset by a boundary.
 
 Hard stops are designed to catch **replays** — the same call, unchanged, with nothing happening in between — not legitimate iteration:
 

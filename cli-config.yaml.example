@@ -630,6 +630,12 @@ tool_loop_guardrails:
     exact_failure: 5
     same_tool_failure: 8
     idempotent_no_progress: 5
+  # After compaction or a tool-result prune removes earlier results from context:
+  #   reset - the new context starts its own count of repeated successful results
+  #   hold  - keep the count, but the first re-read after the boundary is not counted
+  #   off   - ignore the boundary
+  # Repeated failures and per-turn caps are never reset.
+  after_context_loss: reset
 
 # =============================================================================
 # Context Compression (Auto-shrinks long conversations)

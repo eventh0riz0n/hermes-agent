@@ -66,6 +66,10 @@ PROGRESS_RESET_TOOL_NAMES = frozenset({
 })
 
 _BOOL_FIELDS = ("warnings_enabled", "hard_stop_enabled", "non_interactive_hard_stop_enabled")
+# What a context-loss boundary (compaction, prune, native checkpoint) does to success-repeat counts:
+# reset = the new context starts its own count; hold = the first re-read is free, the count is kept;
+# off = boundaries are ignored. Failure counters and loop caps never change at a boundary.
+AFTER_CONTEXT_LOSS_MODES = ("reset", "hold", "off")
 # Threshold field -> (nested section, nested key). The flat legacy key is the field name itself.
 _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_warn_after": ("warn_after", "exact_failure"),
@@ -127,6 +131,7 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    after_context_loss: str = "reset"
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
@@ -149,7 +154,11 @@ class ToolCallGuardrailConfig:
             return _int_at_least(nested, getattr(d, name), 1)
 
         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
+        mode = str(data.get("after_context_loss") or "").strip().lower()
+        return cls(
+            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds,
+            after_context_loss=mode if mode in AFTER_CONTEXT_LOSS_MODES else d.after_context_loss,
+        )
 
 
 @dataclass(frozen=True)
@@ -305,10 +314,26 @@ _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
 
 
 class ToolCallGuardrailController:
-    """Per-turn controller for repeated failed/non-progressing tool calls."""
+    """Per-turn controller for repeated failed/non-progressing tool calls.
+
+    "Same result again" detection assumes the model still holds the earlier result. A context-loss
+    boundary (compaction, tool-result prune, native checkpoint) breaks that assumption (#109683);
+    ``config.after_context_loss`` picks the response for success-repeat state:
+
+    - ``reset`` (default): the new context gets its own count: no-progress records, the identical
+      streak and cycle history are cleared.
+    - ``hold``: records carry the context generation they were last delivered in; the first identical
+      repeat after a boundary is a re-anchor that does not count, later ones count on top of the kept
+      count, so a loop that re-reads more than once per context still accumulates across boundaries.
+    - ``off``: boundaries are ignored (pre-#109683 behaviour).
+
+    Failure counters, loop caps and halt decisions never change at a boundary: a call that keeps
+    failing is a loop on either side of it, and compaction restores no work budget.
+    """
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._context_generation = 0
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
@@ -316,7 +341,8 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts: dict[str, int] = {}
         # signature -> a mutating call succeeded since its last failure
         self._progress_since_failure: dict[ToolCallSignature, bool] = {}
-        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        # signature -> (result hash, repeat count, context generation the result was last delivered in)
+        self._no_progress: dict[ToolCallSignature, tuple[str, int, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Identical-call streak: CONSECUTIVE identical (tool, args, result) calls; any different call or
         # result resets it, so re-reads after edits and varied polling are never flagged.
@@ -329,6 +355,7 @@ class ToolCallGuardrailController:
         self._identical_streak_result_hash: str = ""
         self._identical_streak_count: int = 0
         self._identical_streak_first_call_id: str = ""
+        self._identical_streak_generation: int = self._context_generation
         # Batch-cycle loop breaker (port of can1357/oh-my-pi#10521): sequence of
         # (signature, result_hash, repeatable) for every observed call this turn, so a repeating
         # multi-call cycle (A,B,A,B,...) is caught even though it resets the consecutive streak above.
@@ -337,6 +364,28 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+
+    def note_context_boundary(self) -> None:
+        """Earlier tool results just left the model-visible context; apply ``after_context_loss``.
+
+        Cycle history is dropped in both active modes: a lap spanning the boundary compares a result
+        the model can no longer see.
+        """
+        mode = self.config.after_context_loss
+        if mode == "off":
+            return
+        self._context_generation += 1
+        self._call_history.clear()
+        if mode == "reset":
+            self._no_progress.clear()
+            self._identical_streak_sig = None
+            self._identical_streak_result_hash = ""
+            self._identical_streak_count = 0
+            self._identical_streak_first_call_id = ""
+
+    def _is_reanchor(self, generation: int) -> bool:
+        """An identical repeat whose previous delivery predates the latest context boundary."""
+        return generation != self._context_generation
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -426,8 +475,13 @@ class ToolCallGuardrailController:
 
         result_hash = _result_hash(result, tool_name)
         previous = self._no_progress.get(signature)
+        if previous is not None and previous[0] == result_hash and self._is_reanchor(previous[2]):
+            # Re-anchor after a context boundary: the model lost the earlier copy, so this read
+            # is not "no progress". Keep the count (a loop resumes from it) but do not advance it.
+            self._no_progress[signature] = (result_hash, previous[1], self._context_generation)
+            return ToolGuardrailDecision(tool_name=tool_name, count=previous[1], signature=signature)
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
-        self._no_progress[signature] = (result_hash, repeat_count)
+        self._no_progress[signature] = (result_hash, repeat_count, self._context_generation)
         if warnings and repeat_count >= self.config.no_progress_warn_after:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
@@ -450,15 +504,28 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         result_hash = _result_hash(result, tool_name) if is_plain_str else ""
 
+        reanchor = False
         if is_plain_str and (signature, result_hash) == (self._identical_streak_sig, self._identical_streak_result_hash):
-            self._identical_streak_count += 1
+            if self._is_reanchor(self._identical_streak_generation):
+                # Same result, but the copy the streak points at was dropped by a context boundary:
+                # this one becomes the visible reference; the count holds so a loop still halts.
+                reanchor = True
+                self._identical_streak_first_call_id = tool_call_id or ""
+            else:
+                self._identical_streak_count += 1
         else:
             # New streak; non-string (multimodal) results never form one.
             self._identical_streak_sig = signature if is_plain_str else None
             self._identical_streak_result_hash = result_hash
             self._identical_streak_count = 1 if is_plain_str else 0
             self._identical_streak_first_call_id = tool_call_id or ""
+        self._identical_streak_generation = self._context_generation
         count = self._identical_streak_count
+        if reanchor:
+            if is_plain_str:
+                self._call_history.append((signature, result_hash, is_stall_guard_repeatable(tool_name)))
+            # No notice, no halt and no stub: a stub would point the model at a result it no longer has.
+            return IdenticalCallObservation()
 
         notice = kind = None
         if not is_stall_guard_repeatable(tool_name) and count >= STALL_GUARD_IDENTICAL_CALL_THRESHOLD:

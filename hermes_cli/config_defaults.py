@@ -562,9 +562,9 @@ DEFAULT_CONFIG = {
         # ignores warnings); interactive cli/tui/desktop/acp stay warning-only.
         "non_interactive_hard_stop_enabled": True,
         "warn_after": {"exact_failure": 2, "same_tool_failure": 3, "idempotent_no_progress": 2},
-        "hard_stop_after": {
-            "exact_failure": 5, "same_tool_failure": 8, "idempotent_no_progress": 5
-        },
+        "hard_stop_after": {"exact_failure": 5, "same_tool_failure": 8, "idempotent_no_progress": 5},
+        # After compaction/prune drops tool results: reset | hold | off (failures and caps never reset).
+        "after_context_loss": "reset",
         # Per-turn hard ceilings for runaway-prone tools; counters reset every turn, always on
         # regardless of the thresholds above. Dozens of searches/subagents in ONE turn is already
         # pathological, hence low defaults. 0 = unlimited.
